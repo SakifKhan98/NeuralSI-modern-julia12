@@ -2,33 +2,26 @@
 # Networks.jl (Julia ≥1.12)
 ##############################
 
-# Keep Flux/DataLoader, drop CUDA/DiffEqFlux/Transformers/Plots/TBLogger
 using Flux
-# using Flux.Data: DataLoader
+using Functors
+using Flux: cpu
 using MLUtils: DataLoader
 using Random
-
-# CairoMakie for visualizations (consistent with ODEfunctions.jl)
 using CairoMakie
 
-# ------------------------------------------------------------------
-# Split layer: fanout to multiple subpaths, same as your original
-# ------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Split layer (same behavior as before)
+# -----------------------------------------------------------------------------
 struct Split{T}
     paths::T
 end
 Split(paths...) = Split(paths)
-Flux.@functor Split
+Functors.@functor Split
 (m::Split)(x::AbstractArray) = map(f -> f(x), m.paths)
 
-# ------------------------------------------------------------------
-# Minimal positional embedding (replaces Transformers.Basic.PositionEmbedding)
-# We keep the same API you use in main.jl:
-#     pe = PositionEmbedding(1)
-#     NN_input = pe(xlmap[cpu(index_input)]')'
-# Default behavior = identity (no change in dimensions).
-# If you want sinusoidal features later, flip `mode=:sinusoid` below.
-# ------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Minimal PositionEmbedding — default identity (keeps your shapes)
+# -----------------------------------------------------------------------------
 struct PositionEmbedding
     d::Int
     mode::Symbol
@@ -37,49 +30,30 @@ end
 PositionEmbedding(d::Integer; mode::Symbol = :identity, scale::Real = 1.0) =
     PositionEmbedding(d, mode, Float32(scale))
 
-function loader(datalength, minibatch_size, sample_ratio, rng=123)
-    # pick a random subset of indices
-    idx = Random.randsubseq(MersenneTwister(rng), 1:datalength, sample_ratio)
-    # truncate to a multiple of minibatch_size
-    k = length(idx) - rem(length(idx), minibatch_size)
-    idx = idx[1:k]
-    # make fixed-size batches
-    batches = [idx[i:i+minibatch_size-1] for i in 1:minibatch_size:k]
-    return batches  # iterate with: for idxbatch in train_loader
-end
-
-
 function (pe::PositionEmbedding)(x::AbstractArray)
-    # x is typically (features × batch) OR (batch × features) depending on your pipeline.
-    # Your code transposes twice around this call, so returning `x` as-is preserves shapes.
-    if pe.mode === :identity
-        return x
-    elseif pe.mode === :sinusoid
-        # Simple sinusoidal along the *last* dimension; keep shape-compatible.
-        # Applies sin/cos to the input and concatenates features.
-        # Use with care if your NN dims expect the original width.
+    pe.mode === :identity && return x
+    if pe.mode === :sinusoid
         s = sin.(x .* pe.scale)
         c = cos.(x .* pe.scale)
-        return vcat(x, s, c)
-    else
-        return x
+        return vcat(x, s, c)   # NOTE: changes feature width; adjust dims if you use this
     end
+    return x
 end
 
-# ------------------------------------------------------------------
-# Sampler/DataLoader (unchanged behavior)
-# ------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Data loader — random subset, batched by MLUtils
+# -----------------------------------------------------------------------------
 function loader(datalength, minibatch_size, sample_ratio, rng=123)
-    idx = Random.randsubseq(MersenneTwister(rng), 1:datalength, sample_ratio)  # random subset
-    # ensure length is multiple of minibatch_size
-    k = length(idx) - rem(length(idx), minibatch_size)
-    train_index = Flux.cpu(idx[1:k])
-    return DataLoader(train_index; batchsize=minibatch_size, shuffle=true)
+    idx = Random.randsubseq(MersenneTwister(rng), 1:datalength, sample_ratio)
+    k   = length(idx) - rem(length(idx), minibatch_size)
+    idx = idx[1:k]
+    # DataLoader will slice this vector into batches of Int indices
+    return DataLoader(idx; batchsize=minibatch_size, shuffle=true)
 end
 
-# ------------------------------------------------------------------
-# Feedforward blocks (same math as before)
-# ------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# FFNN blocks (match original)
+# -----------------------------------------------------------------------------
 function def_FFNN_sigmoid(dim::AbstractVector{<:Integer})
     layer = Dense(dim[1], dim[2], sigmoid)
     for i in 2:length(dim)-1
@@ -88,8 +62,11 @@ function def_FFNN_sigmoid(dim::AbstractVector{<:Integer})
     return Chain(layer...)
 end
 
+# Scaled damping head: map outputs to a realistic 15..25 range
+_vc_out(x) = 15f0 .+ 10f0 .* σ.(x)
+
 function def_FFNN_no_digmoid_output_vc(dim::AbstractVector{<:Integer})
-    layer = Dense(dim[end-1], dim[end], x -> abs(x))
+    layer = Dense(dim[end-1], dim[end], _vc_out)
     for i in 2:length(dim)-1
         layer = cat(Dense(dim[end-i], dim[end-i+1], sigmoid), layer; dims=1)
     end
@@ -98,76 +75,102 @@ end
 
 function NN_model(NNdims1::AbstractVector{<:Integer}, NNdims2::AbstractVector{<:Integer})
     NN1 = def_FFNN_sigmoid(NNdims1)
-    NN1 = Chain(NN1[:]..., x -> 0.6f0 .* x .+ 0.7f0)   # same affine post-scale/shift
+    NN1 = Chain(NN1[:]..., x -> 0.6f0 .* x .+ 0.7f0)   # same affine shift/scale as original
     NN2 = def_FFNN_no_digmoid_output_vc(NNdims2)
     model = Chain(Split(NN1, NN2))
     return model
 end
 
-# ------------------------------------------------------------------
-# Globals expected from main.jl/environment:
-#   pe, xlmap, re, NNparam, func!, x0, solver, tspan, tl, y, Nx
-#   solveODE(...) is defined in ODEfunctions.jl
-# ------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Globals expected from main.jl (they are set there with `global ...`)
+# -----------------------------------------------------------------------------
+# Nx, xll, p0, xlmap, pe, func!, x0, solver, tspan, tl, y
+# A1, A2, A3, A4, EI, rhoA, b, forced_time, force_magnitude
+# abstol, reltol, prob_template, prob2_template
+# NNparam, re
+# Also: we write to globals `p` and `loss_value` (used by callbacks/plots).
 
-# lossfunc keeps your original semantics:
-# - Reconstructs model via re(NNparam)
-# - Computes p = [vp; vc]
-# - Predicts displacement via solveODE
-# - MAE on selected indices, scaled by 1e4
-# NOTE: `loss_value` and `p` are kept as globals because your callback uses them.
+# -----------------------------------------------------------------------------
+# Loss function — uses ODEProblem template + tolerances (fast!)
+# -----------------------------------------------------------------------------
 function lossfunc(index_input)
-    NN_input = pe(xlmap[Flux.cpu(index_input)]')'      # preserve your shapes
-    vp, vc = re(NNparam)(NN_input)                     # model forward pass
+    # 1) Input
+    NN_input = pe(xlmap[Flux.cpu(index_input)]')'
+
+    # 2) Forward pass
+    vp, vc = re(NNparam)(NN_input)
+
+    # 3) Assemble parameter vector for the ODE
     global p = vcat(vp, vc)
-    prediction = solveODE(func!; p = p, x0 = x0, solver = solver, tspan = tspan, tl = tl)
-    loss = 1e4 * mean(abs, (y .- prediction)[Flux.cpu(index_input)])
+
+    # 4) Reuse the ODE template and SOLVE with an EXPLICIT ADJOINT
+    #    (prevents Zygote from trying to AD through solver internals)
+    prob = remake(prob_template; p = p)
+    sol  = solve(
+        prob, solver;
+        saveat   = tl,
+        abstol   = abstol,
+        reltol   = reltol,
+        sensealg = InterpolatingAdjoint(autojacvec = ZygoteVJP()),  # <-- key
+        # turn off event saving / dense output to keep the tape simple
+        save_everystep = false,
+    )
+
+    prediction = Array(sol)[1, :, :]  # (Nx × Nt) displacement
+
+    # 5) Loss
+    raw_mae = mean(abs, (y .- prediction)[Flux.cpu(index_input)])
+    loss    = 1e4 * raw_mae
     global loss_value = loss
+
+    # 6) Don't let Zygote trace logging
+    Zygote.ignore() do
+        @info "mae_unscaled" mae = raw_mae
+    end
+
     return loss
 end
 
-# ------------------------------------------------------------------
-# Visual helpers — CairoMakie versions
-# ------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Visual helpers (CairoMakie, single-figure layout)
+# -----------------------------------------------------------------------------
 function visual_vp!(ax, v)
     scatter!(ax, xll, p0[1:Nx]; markersize=6, label="True")
-    lines!(ax,   xll, v[1:Nx];   label="Predict")
+    lines!(ax,   xll, v[1:Nx];   label="Predict", linewidth=3)
     ax.title  = "Modulus coefficient P"
     ax.xlabel = "x"
     ax.ylabel = "value"
 end
 
-# --- REPLACE visual_vc ---
 function visual_vc!(ax, v)
     scatter!(ax, xll[2:end-1], p0[Nx+2:end-1]; markersize=6, label="True")
-    lines!(ax,   xll[2:end-1], v[Nx+2:end-1];   label="Predict")
+    lines!(ax,   xll[2:end-1], v[Nx+2:end-1];   label="Predict", linewidth=3)
     ax.title  = "Damping C"
     ax.xlabel = "x"
     ax.ylabel = "value"
 end
 
 function cb_vp_vc()
-    fig = Figure(size = (700, 520))  # was resolution=...
+    fig = Figure(size = (720, 520))
     ax1 = Axis(fig[1,1])
     ax2 = Axis(fig[2,1])
 
-    visual_vp!(ax1, p)
-    axislegend(ax1; position=:lt)
-
-    visual_vc!(ax2, p)
-    axislegend(ax2; position=:rt)
+    visual_vp!(ax1, p); axislegend(ax1; position=:lt)
+    visual_vc!(ax2, p); axislegend(ax2; position=:rt)
 
     display(fig)
 
     println("loss: ", loss_value)
-    @info "loss" loss = loss_value
+    @info "loss_scaled" loss = loss_value
     return false
 end
 
-# Optionally, keep a composite "results" figure similar to the original.
-# `jetmap` is provided in ODEfunctions.jl (CairoMakie version).
+# Composite results figure (optional; not used during training by default)
 function results(v)
-    predict = solveODE(func!; p=v, x0=x0, solver=solver, tspan=tspan, tl=tl)
+    # Predict displacement with current p = v
+    prob = remake(prob_template; p = v)
+    sol  = solve(prob, solver; saveat = tl, abstol = abstol, reltol = reltol)
+    predict = Array(sol)[1, :, :]
     diff_u  = abs.(y .- predict)
 
     fig = Figure(size = (1000, 900))
@@ -175,9 +178,9 @@ function results(v)
     axP = Axis(fig[1,1]); visual_vp!(axP, v); axislegend(axP; position=:lt)
     axC = Axis(fig[1,2]); visual_vc!(axC, v); axislegend(axC; position=:rt)
 
-    axT = Axis(fig[2,1]); heatmap!(axT, (Array(y) .* 1e3)';  colormap=:jet);   axT.title = "True"
-    axY = Axis(fig[2,2]); heatmap!(axY, (Array(predict) .* 1e3)'; colormap=:jet); axY.title = "Predict"
-    axE = Axis(fig[3,1]); heatmap!(axE, (Array(diff_u) .* 1e3)'; colormap=:jet); axE.title = "Error"
+    axT = Axis(fig[2,1]); heatmap!(axT, xll, tl, (y .* 1e3)';       colormap=:viridis); axT.title = "True"
+    axY = Axis(fig[2,2]); heatmap!(axY, xll, tl, (predict .* 1e3)'; colormap=:plasma);  axY.title = "Predict"
+    axE = Axis(fig[3,1]); heatmap!(axE, xll, tl, (diff_u .* 1e3)';  colormap=:magma);   axE.title = "Error ×1e3"
 
     display(fig)
     return fig
