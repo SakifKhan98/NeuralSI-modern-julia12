@@ -36,7 +36,7 @@ const RESULTS_DIR = joinpath(PROJ_ROOT, "results")
 const FIGS_DIR    = joinpath(RESULTS_DIR, "figs")
 mkpath(DATA_DIR); mkpath(RESULTS_DIR); mkpath(FIGS_DIR)
 
-# Create output folders if missing (assuming you run `julia --project=. src/main.jl` from repo root)
+# Create output folders if missing
 isdir("../data")         || mkpath("../data")
 isdir("../results")      || mkpath("../results")
 isdir("../results/figs") || mkpath("../results/figs")
@@ -104,10 +104,6 @@ if QUICK_TEST
     epochs          = 2
     sample_ratio    = 0.10f0      # only use 10% of samples per epoch
     minibatch_size  = 64          # larger batches to reduce steps
-
-    # # Keep training stable but fast
-    # global USE_SHORT_WINDOW = true   # (if you added the short-window feature)
-    # const ENABLE_TRAIN_PLOTS = false # don’t open plots during training
 end
 
 # ------------------ network & training data ------------------
@@ -170,7 +166,7 @@ try
         bcount = 0
         for idxbatch in train_loader
             bcount += 1
-            loss_val = lossfunc(idxbatch)          # if your lossfunc returns (loss, mae), use its 'loss' part here
+            loss_val = lossfunc(idxbatch)          # if our lossfunc returns (loss, mae), use its 'loss' part here
             gs = Flux.gradient(NNparam) do _
                 loss_val
             end
@@ -228,11 +224,10 @@ if QUICK_TEST
     pred2       = Float32.(pred2_full[1, :, :])   # (Nx × 2Nt)
 
     # Ground-truth on the 2× horizon (with p0)
-    y2_full     = Array(solve(ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), Float64.(p0)),
-                              TRBDF2(); saveat = tl2_64, abstol = 1e-8, reltol = 1e-8))
+    y2_full     = Array(solve(ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), Float64.(p0)), TRBDF2(); saveat = tl2_64, abstol = 1e-8, reltol = 1e-8))
     y2          = Float32.(y2_full[1, :, :])
 
-    # Errors (note: y is your Nx×Nt Float32 training target)
+    # Errors (note: y is our Nx×Nt Float32 training target)
     error1 = mean(abs, pred1 .- y)
     error2 = mean(abs, pred2 .- y2)
     println("Interpolation MAE: ", error1)
@@ -249,7 +244,7 @@ if QUICK_TEST
     @info "saved" file = joinpath(DATA_DIR, "NeuralSI-pred2.txt") exists = isfile(joinpath(DATA_DIR, "NeuralSI-pred2.txt"))
 else
     # ---------- EVALUATION WITHOUT MTK ----------
-    # Save trained params *before* any evaluation, so you don't lose them if something crashes.
+    # Save trained params *before* any evaluation, so we don't lose them if something crashes.
 
     # Use Float64 just for solving to avoid Float32 dt<eps issues
     x0_eval = Float64.(x0)
@@ -268,11 +263,10 @@ else
     pred2       = pred2_full[1:2:2Nx, :]
 
     # Ground truth at double horizon (from p0)
-    y2_full = Array(solve(ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), Float64.(p0)),
-                          TRBDF2(); saveat=tl2, abstol=1e-8, reltol=1e-8))
+    y2_full = Array(solve(ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), Float64.(p0)), TRBDF2(); saveat=tl2, abstol=1e-8, reltol=1e-8))
     y2      = y2_full[1:2:2Nx, :]
 
-    error1 = mean(abs, pred1 .- Float32.(y))   # y is your original Float32 training target
+    error1 = mean(abs, pred1 .- Float32.(y))   # y is our original Float32 training target
     error2 = mean(abs, pred2 .- Float32.(y2))
     println("Interpolation MAE: ", error1)
     println("Extrapolation  MAE: ", error2)
@@ -292,7 +286,7 @@ end
 Plotting.generate_all_figures(
     xll = xll,
     tl  = tl,
-    tl2 = LinRange(0.0, 2*tmax, 2*Nt),  # same tl2 you used in evaluation
+    tl2 = LinRange(0.0, 2*tmax, 2*Nt),  # same tl2 we used in evaluation
     y   = y,
     y2  = y2,
     pred1 = pred1,

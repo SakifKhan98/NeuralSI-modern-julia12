@@ -20,7 +20,7 @@ Functors.@functor Split
 (m::Split)(x::AbstractArray) = map(f -> f(x), m.paths)
 
 # -----------------------------------------------------------------------------
-# Minimal PositionEmbedding — default identity (keeps your shapes)
+# Minimal PositionEmbedding — default identity
 # -----------------------------------------------------------------------------
 struct PositionEmbedding
     d::Int
@@ -35,7 +35,7 @@ function (pe::PositionEmbedding)(x::AbstractArray)
     if pe.mode === :sinusoid
         s = sin.(x .* pe.scale)
         c = cos.(x .* pe.scale)
-        return vcat(x, s, c)   # NOTE: changes feature width; adjust dims if you use this
+        return vcat(x, s, c)   # NOTE: changes feature width; adjust dims if we use this
     end
     return x
 end

@@ -12,7 +12,7 @@ using DelimitedFiles
 using BandedMatrices
 
 # NOTE: We do NOT `using Plots` anymore.
-# If you still want the old Plots-based heatmap, see the note at the bottom.
+# If we still want the old Plots-based heatmap, see the note at the bottom.
 
 # ------------------------------------------------------------------
 # External globals expected from main.jl:
@@ -109,7 +109,7 @@ end
 
 # ------------------------------------------------------------------
 # Lightweight heatmap utility using CairoMakie (instead of Plots)
-# Keeps your previous `jetmap(y)` call working without Plots.jl.
+# Keeps the previous `jetmap(y)` call working without Plots.jl.
 # ------------------------------------------------------------------
 function jetmap(data; title::AbstractString = "", tl = tl)
     # data is (Nx × Nt); we plot Nt on x-axis
@@ -127,7 +127,7 @@ end
 # ------------------------------------------------------------------
 function results(v; position_p=:bottomleft, position_c=:bottomright)
     # These helpers (visual_vp / visual_vc) were referenced in the original code.
-    # If you need them, keep their definitions in your repo; otherwise omit.
+    # If we need them, keep their definitions in our repo; otherwise omit.
     # Here we only compute prediction and show three fields with jetmap.
     predict = solveODE(beam_nonlinear!; p = v, x0 = x0, solver = solver, tspan = tspan, tl = tl)
     diff_u  = abs.(y .- predict)

@@ -1,8 +1,5 @@
 # FrechetDistance.jl  (Julia ≥1.12)
 # Discrete Fréchet distance between two 2D polylines defined on the same x-grid.
-# Usage in your code:
-#   a = frdist(p[1:Nx],        p0[1:Nx],        xll)
-#   b = frdist(p[Nx+2:end-1],  p0[Nx+2:end-1],  xll[2:end-1])
 
 using LinearAlgebra
 
