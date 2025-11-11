@@ -21,43 +21,28 @@ using BandedMatrices
 #   A1, A2, A3, A4  (via get_BandedMatrix)
 # ------------------------------------------------------------------
 
-@inline function myforce(t)::Float32
-    # returns a scalar force scale; broadcasting with `b` happens in beam_nonlinear!
-    # (-sign(t - forced_time) + 1) * force_magnitude / 2
-    # keep Float32 to match rest of pipeline
-    return ((-sign(t - forced_time) + 1.0f0) * (force_magnitude * 0.5f0))::Float32
+# MTK-safe, differentiable, type-stable
+@inline function myforce(t)
+    ft = one(t) * forced_time          # promote to eltype(t)
+    FM = one(t) * force_magnitude      # promote to eltype(t)
+    ifelse(t < ft, FM, zero(t))        # 1*FM for t<ft, 0 otherwise
 end
 
 function beam_nonlinear!(du, u, p, t)
-    # u, du are size (2, Nx)
-    # p = [pK; cdamp] with pK = stiffness (Nx), cdamp = damping (Nx)
-    @inbounds begin
-        du[1, :] = u[2, :]
+    # Promote physical constants to eltype(t)
+    EI_  = one(t) * EI
+    ρA   = one(t) * rhoA
+    b_   = (one(t) * 1) .* b          # same shape as b, eltype(t)
 
-        pK  = @view p[1:Nx]
-        cdp = @view p[Nx+1:end]          # damping vector (Nx)
+    du[1, :] = u[2, :]
 
-        u1  = @view u[1, :]
-        u2  = @view u[2, :]
-
-        # Elastic terms: (Nx) each
-        term = (A2 * (pK .* (A2 * u1))) .+
-               (A1 * (pK .* (2f0 .* (A3 * u1)))) .+
-               (pK .* (A4 * u1))
-
-        # Boundary mask as a vector (Nx)
-        bvec = vec(b)
-
-        # External force (scalar) broadcasted over mask (Nx)
-        fext = (myforce(t) / rhoA) .* bvec
-
-        # Damping: (cdp .* u2) / rhoA, then masked by b
-        damp = ((cdp .* u2) ./ rhoA) .* bvec
-
-        # Final acceleration row
-        du[2, :] = .-(EI / rhoA) .* term .+ fext .- damp
-    end
-    return nothing
+    du[2, :] = -EI_ / ρA .* (
+                   A2 * p[1:Nx] .* (A2 * u[1, :]) .+
+                   A1 * p[1:Nx] .* (A3 * u[1, :]) .* 2 .+
+                      p[1:Nx]    .* (A4 * u[1, :])
+               ) .+
+               myforce(t) / ρA .* b_ .-
+               p[Nx+1:end] .* u[2, :] ./ ρA .* b_
 end
 
 

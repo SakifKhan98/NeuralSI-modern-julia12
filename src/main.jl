@@ -26,11 +26,22 @@ include("ODEfunctions.jl")         # beam_nonlinear!, solveODE, get_BandedMatrix
 include("Networks.jl")             # loader, PositionEmbedding, NN_model, lossfunc, cb_vp_vc, visual_*
 include("FrechetDistance.jl")      # frdist
 include("plotting.jl")            # plot_elemental, plot_perf_summary
+using .Plotting
+
+
+# ---- stable project paths ----
+const PROJ_ROOT   = normpath(joinpath(@__DIR__, ".."))
+const DATA_DIR    = joinpath(PROJ_ROOT, "data")
+const RESULTS_DIR = joinpath(PROJ_ROOT, "results")
+const FIGS_DIR    = joinpath(RESULTS_DIR, "figs")
+mkpath(DATA_DIR); mkpath(RESULTS_DIR); mkpath(FIGS_DIR)
 
 # Create output folders if missing (assuming you run `julia --project=. src/main.jl` from repo root)
 isdir("../data")         || mkpath("../data")
 isdir("../results")      || mkpath("../results")
 isdir("../results/figs") || mkpath("../results/figs")
+
+const QUICK_TEST = true
 
 # ------------------ Problem setup: space, time, materials ------------------
 Random.seed!(1234)
@@ -70,8 +81,9 @@ force_magnitude = 1000f0
 # Initial condition, solver, tolerances
 x0     = zeros(Float32, 2, Nx)                  # states: [disp; vel]
 b      = ones(Float32, Nx, 1); b[[1, Nx]] .= 0f0
-solver = Tsit5()
-abstol = 1e-8; reltol = 1e-8
+solver = TRBDF2()
+abstol = 1e-8
+reltol = 1e-8
 
 # ODE RHS alias (must exist before building problems)
 func! = beam_nonlinear!
@@ -86,6 +98,17 @@ prob2_template = ODEProblem(func!, x0, tspan2, p0)
 # ------------------ ground truth (training target) ------------------
 @time y = solveODE(func!; p = p0, x0 = x0, solver = solver, tspan = tspan, tl = tl)  # (Nx × Nt)
 jetmap(y; title = "True displacement (mm-scaled)")
+
+if QUICK_TEST
+    # Fewer epochs & fewer batches per epoch
+    epochs          = 2
+    sample_ratio    = 0.10f0      # only use 10% of samples per epoch
+    minibatch_size  = 64          # larger batches to reduce steps
+
+    # # Keep training stable but fast
+    # global USE_SHORT_WINDOW = true   # (if you added the short-window feature)
+    # const ENABLE_TRAIN_PLOTS = false # don’t open plots during training
+end
 
 # ------------------ network & training data ------------------
 sample_ratio   = 0.5f0
@@ -134,64 +157,47 @@ global p = p0
 # call cb rarely to avoid slow plotting during training
 cb()
 
+
+const MAX_BATCHES = QUICK_TEST ? 10 : typemax(Int)
 # ---------------------- training (modern Flux + Optimisers) ----------------------
 try
+    # How many batches per epoch to run (throttle when QUICK_TEST=true)
     # ----- Phase 1 -----
     opt = Optimisers.OptimiserChain(Optimisers.ClipGrad(1.0f0), Optimisers.AdamW(0.005f0))
     opt = Flux.setup(opt, NNparam)
-    for epoch_idx in 1:10
+
+    for epoch_idx in 1:min(10, epochs)
+        bcount = 0
         for idxbatch in train_loader
+            bcount += 1
+            loss_val = lossfunc(idxbatch)          # if your lossfunc returns (loss, mae), use its 'loss' part here
             gs = Flux.gradient(NNparam) do _
-                lossfunc(idxbatch)
+                loss_val
             end
             Flux.update!(opt, NNparam, gs[1])
+            (bcount >= MAX_BATCHES) && break
         end
-        (epoch_idx % 5 == 0) ? cb() : @info "loss_scaled" loss = loss_value
+        (epoch_idx % 5 == 0) ? cb() : @info "training_progress" epoch = epoch_idx loss_scaled = loss_value
     end
 
     # ----- Phase 2 -----
-    opt = Optimisers.OptimiserChain(Optimisers.ClipGrad(1.0f0), Optimisers.AdamW(0.001f0))
-    opt = Flux.setup(opt, NNparam)
-    for epoch_idx in 1:(epochs - 10)
-        for idxbatch in train_loader
-            gs = Flux.gradient(NNparam) do _
-                lossfunc(idxbatch)
-            end
-            Flux.update!(opt, NNparam, gs[1])
-        end
-        (epoch_idx % 5 == 0) ? cb() : @info "loss_scaled" loss = loss_value
-    end
-catch e
-    # Print the true error to the terminal (VS Code often hides it)
-    Base.showerror(stderr, e, catch_backtrace())
-    flush(stderr)
-    rethrow()
-end
-try
-    # ----- Phase 1 -----
-    opt = Optimisers.OptimiserChain(Optimisers.ClipGrad(1.0f0), Optimisers.AdamW(0.005f0))
-    opt = Flux.setup(opt, NNparam)
-    for epoch_idx in 1:10
-        for idxbatch in train_loader
-            gs = Flux.gradient(NNparam) do _
-                lossfunc(idxbatch)
-            end
-            Flux.update!(opt, NNparam, gs[1])
-        end
-        (epoch_idx % 5 == 0) ? cb() : @info "loss_scaled" loss = loss_value
-    end
+    if epochs > 10
+        opt = Optimisers.OptimiserChain(Optimisers.ClipGrad(1.0f0), Optimisers.AdamW(0.001f0))
+        opt = Flux.setup(opt, NNparam)
 
-    # ----- Phase 2 -----
-    opt = Optimisers.OptimiserChain(Optimisers.ClipGrad(1.0f0), Optimisers.AdamW(0.001f0))
-    opt = Flux.setup(opt, NNparam)
-    for epoch_idx in 1:(epochs - 10)
-        for idxbatch in train_loader
-            gs = Flux.gradient(NNparam) do _
-                lossfunc(idxbatch)
+        for epoch_idx in 11:epochs
+            bcount = 0
+            for idxbatch in train_loader
+                bcount += 1
+                loss_val = lossfunc(idxbatch)
+                gs = Flux.gradient(NNparam) do _
+                    loss_val
+                end
+                Flux.update!(opt, NNparam, gs[1])
+                (bcount >= MAX_BATCHES) && break
             end
-            Flux.update!(opt, NNparam, gs[1])
+            (epoch_idx % 5 == 0) ? cb() : @info "training_progress" epoch = epoch_idx loss_scaled = loss_value
         end
-        (epoch_idx % 5 == 0) ? cb() : @info "loss_scaled" loss = loss_value
     end
 catch e
     # Print the true error to the terminal (VS Code often hides it)
@@ -200,51 +206,106 @@ catch e
     rethrow()
 end
 
-
+writedlm("../results/p_final.txt", p)
+writedlm("../results/NNparam_final.txt", NNparam)
 println("\ntraining done!")
 
-# ---------------------- check performance & MTK solve ----------------------
-# Fréchet distance between learned and true parameters
-a  = frdist(p[1:Nx],        p0[1:Nx],       xll)
-b_ = frdist(p[Nx+2:end-1],  p0[Nx+2:end-1], xll[2:end-1])   # name `b_` to avoid clash with mask `b`
-println("Fréchet(P): ", a, "   Fréchet(C): ", b_)
+if QUICK_TEST
+    # ---------------------- quick numeric evaluation (no MTK) ----------------------
+    # Use Float64 for robust ODE solves; cast back to Float32 for error calc/saving
+    x0_eval = Float64.(x0)
+    p_eval  = Float64.(p)
 
-# Interpolation prediction via ModelingToolkit structural_simplify
-tl2 = LinRange(0, 2*tmax, 2*Nt)
+    # Interpolation horizon
+    prob_eval   = ODEProblem(func!, x0_eval, (0.0, Float64(tmax)), p_eval)
+    pred1_full  = Array(solve(prob_eval, TRBDF2(); saveat = Float64.(tl), abstol = 1e-8, reltol = 1e-8))
+    pred1       = Float32.(pred1_full[1, :, :])   # (Nx × Nt) displacement
 
-prob = ODEProblem(func!, x0, tspan, p)
-sys  = modelingtoolkitize(prob)
-sysS = structural_simplify(sys)
-fastprob  = ODEProblem(sysS, x0, tspan,  p)
-fastprob2 = ODEProblem(sysS, x0, (0.0f0, 2*tmax), p)
+    # Extrapolation horizon (2×)
+    tl2_64      = LinRange(0.0, 2*Float64(tmax), 2*Nt)
+    prob_eval2  = ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), p_eval)
+    pred2_full  = Array(solve(prob_eval2, TRBDF2(); saveat = tl2_64, abstol = 1e-8, reltol = 1e-8))
+    pred2       = Float32.(pred2_full[1, :, :])   # (Nx × 2Nt)
 
-pred1_sol = solve(
-    fastprob, ImplicitEulerExtrapolation();
-    p=p, saveat=tl,
-    sensealg = InterpolatingAdjoint(autojacvec=ZygoteVJP()),
-    abstol=1e-8, reltol=1e-8
+    # Ground-truth on the 2× horizon (with p0)
+    y2_full     = Array(solve(ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), Float64.(p0)),
+                              TRBDF2(); saveat = tl2_64, abstol = 1e-8, reltol = 1e-8))
+    y2          = Float32.(y2_full[1, :, :])
+
+    # Errors (note: y is your Nx×Nt Float32 training target)
+    error1 = mean(abs, pred1 .- y)
+    error2 = mean(abs, pred2 .- y2)
+    println("Interpolation MAE: ", error1)
+    println("Extrapolation  MAE: ", error2)
+
+    writedlm(joinpath(RESULTS_DIR, "p_final.txt"), p)
+    writedlm(joinpath(RESULTS_DIR, "NNparam_final.txt"), NNparam)
+
+    writedlm(joinpath(DATA_DIR, "y.txt"),              y)
+    writedlm(joinpath(DATA_DIR, "y-extrapolate.txt"),  y2)
+    writedlm(joinpath(DATA_DIR, "NeuralSI-pred.txt"),  pred1)
+    @info "saved" file = joinpath(DATA_DIR, "NeuralSI-pred.txt") exists = isfile(joinpath(DATA_DIR, "NeuralSI-pred1.txt"))
+    writedlm(joinpath(DATA_DIR, "NeuralSI-pred2.txt"), pred2)
+    @info "saved" file = joinpath(DATA_DIR, "NeuralSI-pred2.txt") exists = isfile(joinpath(DATA_DIR, "NeuralSI-pred2.txt"))
+else
+    # ---------- EVALUATION WITHOUT MTK ----------
+    # Save trained params *before* any evaluation, so you don't lose them if something crashes.
+
+    # Use Float64 just for solving to avoid Float32 dt<eps issues
+    x0_eval = Float64.(x0)
+    p_eval  = Float64.(p)
+    tl64    = Float64.(tl)
+    tl2     = LinRange(0.0, 2*Float64(tmax), 2*Nt)
+
+    # Interpolation
+    prob_eval  = ODEProblem(func!, x0_eval, (0.0, Float64(tmax)), p_eval)
+    pred1_full = Array(solve(prob_eval, TRBDF2(); saveat=tl64, abstol=1e-8, reltol=1e-8))
+    pred1      = pred1_full[1:2:2Nx, :]             # displacement rows
+
+    # Extrapolation
+    prob_eval2  = ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), p_eval)
+    pred2_full  = Array(solve(prob_eval2, TRBDF2(); saveat=tl2, abstol=1e-8, reltol=1e-8))
+    pred2       = pred2_full[1:2:2Nx, :]
+
+    # Ground truth at double horizon (from p0)
+    y2_full = Array(solve(ODEProblem(func!, x0_eval, (0.0, 2*Float64(tmax)), Float64.(p0)),
+                          TRBDF2(); saveat=tl2, abstol=1e-8, reltol=1e-8))
+    y2      = y2_full[1:2:2Nx, :]
+
+    error1 = mean(abs, pred1 .- Float32.(y))   # y is your original Float32 training target
+    error2 = mean(abs, pred2 .- Float32.(y2))
+    println("Interpolation MAE: ", error1)
+    println("Extrapolation  MAE: ", error2)
+    
+    writedlm(joinpath(RESULTS_DIR, "p_final.txt"), p)
+    writedlm(joinpath(RESULTS_DIR, "NNparam_final.txt"), NNparam)
+
+    writedlm(joinpath(DATA_DIR, "y.txt"),              y)
+    writedlm(joinpath(DATA_DIR, "y-extrapolate.txt"),  y2)
+    writedlm(joinpath(DATA_DIR, "NeuralSI-pred.txt"),  pred1)
+    @info "saved" file = joinpath(DATA_DIR, "NeuralSI-pred.txt") exists = isfile(joinpath(DATA_DIR, "NeuralSI-pred.txt"))
+    writedlm(joinpath(DATA_DIR, "NeuralSI-pred2.txt"), pred2)
+    @info "saved" file = joinpath(DATA_DIR, "NeuralSI-pred2.txt") exists = isfile(joinpath(DATA_DIR, "NeuralSI-pred2.txt"))
+end
+
+# ---- Make & save figures ----
+Plotting.generate_all_figures(
+    xll = xll,
+    tl  = tl,
+    tl2 = LinRange(0.0, 2*tmax, 2*Nt),  # same tl2 you used in evaluation
+    y   = y,
+    y2  = y2,
+    pred1 = pred1,
+    pred2 = pred2,
+    vp0 = vp0,
+    vc0 = vc0,
+    p   = p,     # final learned (vcat(vp, vc))
+    p0  = p0,    # ground truth (vcat(vp0, vc0))
+    Nx  = Nx,
+    myforce_fn = myforce,                 # from ODEfunctions.jl
+    outdir = joinpath(RESULTS_DIR, "figs")  # or just "results/figs"
 )
-pred1 = Array(pred1_sol)[1:2:Nx*2, :]   # take displacement rows
+println("Saved figures → ", joinpath(RESULTS_DIR, "figs"))
 
-pred2_sol = solve(
-    fastprob2, ImplicitEulerExtrapolation();
-    p=p, saveat=tl2,
-    sensealg = InterpolatingAdjoint(autojacvec=ZygoteVJP()),
-    abstol=1e-8, reltol=1e-8
-)
-pred2 = Array(pred2_sol)[1:2:Nx*2, :]
-
-# Ground truth on extended horizon and errors
-y2     = solveODE(func!; p = p0, x0 = x0, solver = solver, tspan = (0.0f0, 2*tmax), tl = tl2)
-error1 = mean(abs, pred1 .- y)
-error2 = mean(abs, pred2 .- y2)
-println("Interpolation MAE: ", error1)
-println("Extrapolation  MAE: ", error2)
-
-# ---------------------- save outputs ----------------------
-writedlm("../data/y.txt",               y)
-writedlm("../data/y-extrapolate.txt",   y2)
-writedlm("../data/NeuralSI-pred.txt",   pred1)
-writedlm("../data/NeuralSI-pred2.txt",  pred2)
 
 println("Saved outputs under ../data and figures under ../results/figs")

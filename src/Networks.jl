@@ -94,36 +94,39 @@ end
 # Loss function — uses ODEProblem template + tolerances (fast!)
 # -----------------------------------------------------------------------------
 function lossfunc(index_input)
-    # 1) Input
+    # 1) Build NN input
     NN_input = pe(xlmap[Flux.cpu(index_input)]')'
 
     # 2) Forward pass
     vp, vc = re(NNparam)(NN_input)
 
-    # 3) Assemble parameter vector for the ODE
+    # 3) Keep parameters in a stable physical band (helps solver)
+    vp = clamp.(vp, 0.5f0, 1.6f0)   # modulus P(x)
+    vc = clamp.(vc, 10f0, 30f0)     # damping C(x); head already ~15..25
+
+    # 4) Assemble parameter vector
     global p = vcat(vp, vc)
 
-    # 4) Reuse the ODE template and SOLVE with an EXPLICIT ADJOINT
-    #    (prevents Zygote from trying to AD through solver internals)
-    prob = remake(prob_template; p = p)
-    sol  = solve(
-        prob, solver;
+    # 5) Solve ODE robustly during training, in Float64 for stability
+    prob64 = remake(prob_template; p = Float64.(p), u0 = Float64.(x0))
+    sol = solve(
+        prob64, solver;
         saveat   = tl,
         abstol   = abstol,
         reltol   = reltol,
-        sensealg = InterpolatingAdjoint(autojacvec = ZygoteVJP()),  # <-- key
-        # turn off event saving / dense output to keep the tape simple
+        sensealg = InterpolatingAdjoint(autojacvec = ZygoteVJP()),
         save_everystep = false,
     )
 
-    prediction = Array(sol)[1, :, :]  # (Nx × Nt) displacement
+    # 6) Extract prediction and cast back to Float32 to match data
+    prediction = Float32.(Array(sol)[1, :, :])  # (Nx × Nt)
 
-    # 5) Loss
+    # 7) Loss (same scale as original)
     raw_mae = mean(abs, (y .- prediction)[Flux.cpu(index_input)])
     loss    = 1e4 * raw_mae
     global loss_value = loss
 
-    # 6) Don't let Zygote trace logging
+    # Optional: log MAE without touching the AD tape
     Zygote.ignore() do
         @info "mae_unscaled" mae = raw_mae
     end

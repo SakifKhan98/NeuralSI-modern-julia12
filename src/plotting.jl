@@ -20,6 +20,11 @@ plot_setup_fig3(xll, vp0, vc0, tl, myforce_fn; outdir="results/figs", fname="Fig
 
 Generates side-by-side plots of P₀(x), C₀(x), and F(t).
 """
+
+# convert center grid -> bin edges for Makie heatmap
+_center_to_edges(v) = range(first(v) - step(v)/2, last(v) + step(v)/2, length = length(v) + 1)
+
+
 function plot_setup_fig3(xll, vp0, vc0, tl, myforce_fn; outdir="results/figs", fname="Fig3_setup")
     _mkdir(outdir)
     fig = Figure(size=(1000, 320))
@@ -76,17 +81,26 @@ Three stacked heatmaps: Truth, Prediction, Error (mm scaling shown).
 """
 function response_heatmaps(xll, t, y, yhat; title_prefix="Interpolation", fname="Fig6_interp", outdir="results/figs")
     _mkdir(outdir)
-    err = abs.(y .- yhat)
+
+    # Ensure plain matrices (avoid SubArray world-age quirks)
+    Y    = Matrix(y)      # size: (Nx, Nt)
+    Yhat = Matrix(yhat)   # size: (Nx, Nt)
+    Err  = abs.(Y .- Yhat)
+
+    # Build bin edges for Makie (length = size + 1)
+    xe = _center_to_edges(xll)   # length Nx+1
+    te = _center_to_edges(t)     # length Nt+1
+
     fig = Figure(size=_FS_SQ)
 
     ax1 = Axis(fig[1,1], title="$title_prefix – Ground Truth", xlabel="x (m)", ylabel="t (s)")
-    heatmap!(ax1, xll, t, (y .* 1e3)'; colormap=_cmap(:viridis), colorrange=extrema((y .* 1e3)))
+    heatmap!(ax1, xe, te, Y .* 1e3; colormap=_cmap(:viridis))
 
     ax2 = Axis(fig[2,1], title="$title_prefix – Prediction", xlabel="x (m)", ylabel="t (s)")
-    heatmap!(ax2, xll, t, (yhat .* 1e3)'; colormap=_cmap(:plasma), colorrange=extrema((yhat .* 1e3)))
+    heatmap!(ax2, xe, te, Yhat .* 1e3; colormap=_cmap(:plasma))
 
     ax3 = Axis(fig[3,1], title="$title_prefix – Error ×1e3", xlabel="x (m)", ylabel="t (s)")
-    heatmap!(ax3, xll, t, (err .* 1e3)'; colormap=_cmap(:magma))
+    heatmap!(ax3, xe, te, Err .* 1e3; colormap=_cmap(:magma))
 
     path_png = joinpath(outdir, "$fname.png")
     path_pdf = joinpath(outdir, "$fname.pdf")
